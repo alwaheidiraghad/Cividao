@@ -8,12 +8,21 @@
 (define-constant ERR_AMENDMENT_NOT_FOUND (err u106))
 (define-constant ERR_INVALID_QUORUM (err u107))
 (define-constant ERR_NOT_MEMBER (err u108))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u109))
+(define-constant ERR_BUDGET_NOT_FOUND (err u110))
+(define-constant ERR_BUDGET_EXHAUSTED (err u111))
+(define-constant ERR_INVALID_AMOUNT (err u112))
+(define-constant ERR_EXPENSE_NOT_FOUND (err u113))
+(define-constant ERR_BUDGET_ALREADY_EXISTS (err u114))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-amendment-id uint u1)
 (define-data-var total-members uint u0)
 (define-data-var quorum-percentage uint u51)
 (define-data-var voting-period uint u1440)
+(define-data-var treasury-balance uint u0)
+(define-data-var next-budget-id uint u1)
+(define-data-var next-expense-id uint u1)
 
 (define-map members principal bool)
 (define-map member-voting-power principal uint)
@@ -55,6 +64,39 @@
   { vote: bool, voting-power: uint }
 )
 
+(define-map budgets
+  uint
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    total-amount: uint,
+    spent-amount: uint,
+    category: (string-ascii 50),
+    created-at: uint,
+    created-by: principal,
+    active: bool
+  }
+)
+
+(define-map expenses
+  uint
+  {
+    budget-id: uint,
+    amount: uint,
+    description: (string-ascii 200),
+    recipient: principal,
+    approved: bool,
+    created-at: uint,
+    created-by: principal,
+    approved-by: (optional principal)
+  }
+)
+
+(define-map budget-approvals
+  { budget-id: uint, approver: principal }
+  { approved: bool, approval-time: uint }
+)
+
 (define-read-only (get-member-status (member principal))
   (default-to false (map-get? members member))
 )
@@ -89,6 +131,22 @@
 
 (define-read-only (get-voting-period)
   (var-get voting-period)
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance)
+)
+
+(define-read-only (get-budget (budget-id uint))
+  (map-get? budgets budget-id)
+)
+
+(define-read-only (get-expense (expense-id uint))
+  (map-get? expenses expense-id)
+)
+
+(define-read-only (get-budget-approval (budget-id uint) (approver principal))
+  (map-get? budget-approvals { budget-id: budget-id, approver: approver })
 )
 
 (define-read-only (calculate-required-votes)
@@ -245,6 +303,123 @@
     (var-set voting-period new-period)
     (ok true)
   )
+)
+
+(define-public (deposit-to-treasury (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (create-budget (title (string-ascii 100)) (description (string-ascii 500)) (total-amount uint) (category (string-ascii 50)))
+  (let ((budget-id (var-get next-budget-id)))
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? budgets budget-id)) ERR_BUDGET_ALREADY_EXISTS)
+    (map-set budgets budget-id {
+      title: title,
+      description: description,
+      total-amount: total-amount,
+      spent-amount: u0,
+      category: category,
+      created-at: stacks-block-height,
+      created-by: tx-sender,
+      active: true
+    })
+    (var-set next-budget-id (+ budget-id u1))
+    (ok budget-id)
+  )
+)
+
+(define-public (approve-budget (budget-id uint))
+  (let ((budget (unwrap! (get-budget budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (get active budget) ERR_BUDGET_NOT_FOUND)
+    (asserts! (is-none (get-budget-approval budget-id tx-sender)) ERR_ALREADY_VOTED)
+    (map-set budget-approvals { budget-id: budget-id, approver: tx-sender } { approved: true, approval-time: stacks-block-height })
+    (ok true)
+  )
+)
+
+(define-public (create-expense (budget-id uint) (amount uint) (description (string-ascii 200)) (recipient principal))
+  (let (
+    (expense-id (var-get next-expense-id))
+    (budget (unwrap! (get-budget budget-id) ERR_BUDGET_NOT_FOUND))
+  )
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active budget) ERR_BUDGET_NOT_FOUND)
+    (asserts! (<= (+ (get spent-amount budget) amount) (get total-amount budget)) ERR_BUDGET_EXHAUSTED)
+    (map-set expenses expense-id {
+      budget-id: budget-id,
+      amount: amount,
+      description: description,
+      recipient: recipient,
+      approved: false,
+      created-at: stacks-block-height,
+      created-by: tx-sender,
+      approved-by: none
+    })
+    (var-set next-expense-id (+ expense-id u1))
+    (ok expense-id)
+  )
+)
+
+(define-public (approve-expense (expense-id uint))
+  (let ((expense (unwrap! (get-expense expense-id) ERR_EXPENSE_NOT_FOUND)))
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (not (get approved expense)) ERR_UNAUTHORIZED)
+    (map-set expenses expense-id (merge expense { approved: true, approved-by: (some tx-sender) }))
+    (ok true)
+  )
+)
+
+(define-public (execute-expense (expense-id uint))
+  (let (
+    (expense (unwrap! (get-expense expense-id) ERR_EXPENSE_NOT_FOUND))
+    (budget-id (get budget-id expense))
+    (budget (unwrap! (get-budget budget-id) ERR_BUDGET_NOT_FOUND))
+    (amount (get amount expense))
+    (recipient (get recipient expense))
+  )
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (get approved expense) ERR_UNAUTHORIZED)
+    (asserts! (>= (var-get treasury-balance) amount) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (get active budget) ERR_BUDGET_NOT_FOUND)
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+    (map-set budgets budget-id (merge budget { spent-amount: (+ (get spent-amount budget) amount) }))
+    (ok true)
+  )
+)
+
+(define-public (deactivate-budget (budget-id uint))
+  (let ((budget (unwrap! (get-budget budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get created-by budget))) ERR_UNAUTHORIZED)
+    (map-set budgets budget-id (merge budget { active: false }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-budget-remaining (budget-id uint))
+  (match (get-budget budget-id)
+    budget (ok (- (get total-amount budget) (get spent-amount budget)))
+    ERR_BUDGET_NOT_FOUND
+  )
+)
+
+(define-read-only (calculate-budget-approval-count (budget-id uint))
+  (let ((required-approvals (calculate-required-votes)))
+    (fold count-budget-approvals (list tx-sender) u0)
+  )
+)
+
+(define-private (count-budget-approvals (approver principal) (acc uint))
+  (+ acc u1)
 )
 
 ;; (define-read-only (get-amendment-yes-votes (amendment-id uint))
