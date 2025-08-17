@@ -14,6 +14,10 @@
 (define-constant ERR_INVALID_AMOUNT (err u112))
 (define-constant ERR_EXPENSE_NOT_FOUND (err u113))
 (define-constant ERR_BUDGET_ALREADY_EXISTS (err u114))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u115))
+(define-constant ERR_BADGE_NOT_FOUND (err u116))
+(define-constant ERR_BADGE_ALREADY_EARNED (err u117))
+(define-constant ERR_INVALID_REPUTATION (err u118))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-amendment-id uint u1)
@@ -23,6 +27,8 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var next-budget-id uint u1)
 (define-data-var next-expense-id uint u1)
+(define-data-var next-badge-id uint u1)
+(define-data-var reputation-decay-rate uint u5)
 
 (define-map members principal bool)
 (define-map member-voting-power principal uint)
@@ -97,6 +103,44 @@
   { approved: bool, approval-time: uint }
 )
 
+(define-map member-reputation
+  principal
+  {
+    total-points: uint,
+    last-activity: uint,
+    proposals-created: uint,
+    successful-proposals: uint,
+    votes-cast: uint,
+    budgets-created: uint
+  }
+)
+
+(define-map merit-badges
+  uint
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    points-required: uint,
+    badge-type: (string-ascii 20),
+    active: bool
+  }
+)
+
+(define-map member-badges
+  { member: principal, badge-id: uint }
+  { earned-at: uint, verified: bool }
+)
+
+(define-map reputation-activities
+  principal
+  {
+    proposal-bonus: uint,
+    voting-bonus: uint,
+    budget-bonus: uint,
+    consecutive-votes: uint
+  }
+)
+
 (define-read-only (get-member-status (member principal))
   (default-to false (map-get? members member))
 )
@@ -149,6 +193,24 @@
   (map-get? budget-approvals { budget-id: budget-id, approver: approver })
 )
 
+(define-read-only (get-member-reputation (member principal))
+  (default-to { total-points: u0, last-activity: u0, proposals-created: u0, successful-proposals: u0, votes-cast: u0, budgets-created: u0 } 
+    (map-get? member-reputation member))
+)
+
+(define-read-only (get-merit-badge (badge-id uint))
+  (map-get? merit-badges badge-id)
+)
+
+(define-read-only (get-member-badge (member principal) (badge-id uint))
+  (map-get? member-badges { member: member, badge-id: badge-id })
+)
+
+(define-read-only (get-reputation-activities (member principal))
+  (default-to { proposal-bonus: u0, voting-bonus: u0, budget-bonus: u0, consecutive-votes: u0 }
+    (map-get? reputation-activities member))
+)
+
 (define-read-only (calculate-required-votes)
   (let ((total-voting-power (var-get total-members)))
     (/ (* total-voting-power (var-get quorum-percentage)) u100)
@@ -170,6 +232,8 @@
     (asserts! (not (get-member-status tx-sender)) ERR_UNAUTHORIZED)
     (map-set members tx-sender true)
     (map-set member-voting-power tx-sender u1)
+    (map-set member-reputation tx-sender { total-points: u10, last-activity: stacks-block-height, proposals-created: u0, successful-proposals: u0, votes-cast: u0, budgets-created: u0 })
+    (map-set reputation-activities tx-sender { proposal-bonus: u0, voting-bonus: u0, budget-bonus: u0, consecutive-votes: u0 })
     (var-set total-members (+ (var-get total-members) u1))
     (ok true)
   )
@@ -422,6 +486,168 @@
   (+ acc u1)
 )
 
+(define-public (create-merit-badge (name (string-ascii 50)) (description (string-ascii 200)) (points-required uint) (badge-type (string-ascii 20)))
+  (let ((badge-id (var-get next-badge-id)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> points-required u0) ERR_INVALID_REPUTATION)
+    (map-set merit-badges badge-id {
+      name: name,
+      description: description,
+      points-required: points-required,
+      badge-type: badge-type,
+      active: true
+    })
+    (var-set next-badge-id (+ badge-id u1))
+    (ok badge-id)
+  )
+)
+
+(define-public (award-reputation-points (member principal) (points uint) (activity-type (string-ascii 20)))
+  (let (
+    (current-rep (get-member-reputation member))
+    (current-activities (get-reputation-activities member))
+  )
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (get-member-status member) ERR_NOT_MEMBER)
+    (asserts! (> points u0) ERR_INVALID_REPUTATION)
+    (map-set member-reputation member (merge current-rep {
+      total-points: (+ (get total-points current-rep) points),
+      last-activity: stacks-block-height
+    }))
+    (unwrap-panic (check-and-award-badges member))
+    (ok true)
+  )
+)
+
+(define-public (update-voting-reputation (voter principal))
+  (let (
+    (current-rep (get-member-reputation voter))
+    (current-activities (get-reputation-activities voter))
+  )
+    (asserts! (get-member-status voter) ERR_NOT_MEMBER)
+    (map-set member-reputation voter (merge current-rep {
+      votes-cast: (+ (get votes-cast current-rep) u1),
+      total-points: (+ (get total-points current-rep) u5),
+      last-activity: stacks-block-height
+    }))
+    (map-set reputation-activities voter (merge current-activities {
+      consecutive-votes: (+ (get consecutive-votes current-activities) u1),
+      voting-bonus: (if (> (get consecutive-votes current-activities) u10) u2 u0)
+    }))
+    (ok true)
+  )
+)
+
+(define-public (update-proposal-reputation (proposer principal) (successful bool))
+  (let (
+    (current-rep (get-member-reputation proposer))
+    (bonus-points (if successful u25 u10))
+  )
+    (asserts! (get-member-status proposer) ERR_NOT_MEMBER)
+    (map-set member-reputation proposer (merge current-rep {
+      proposals-created: (+ (get proposals-created current-rep) u1),
+      successful-proposals: (if successful (+ (get successful-proposals current-rep) u1) (get successful-proposals current-rep)),
+      total-points: (+ (get total-points current-rep) bonus-points),
+      last-activity: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-public (update-budget-reputation (creator principal))
+  (let ((current-rep (get-member-reputation creator)))
+    (asserts! (get-member-status creator) ERR_NOT_MEMBER)
+    (map-set member-reputation creator (merge current-rep {
+      budgets-created: (+ (get budgets-created current-rep) u1),
+      total-points: (+ (get total-points current-rep) u15),
+      last-activity: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-public (apply-reputation-decay (member principal))
+  (let (
+    (current-rep (get-member-reputation member))
+    (decay-rate (var-get reputation-decay-rate))
+    (blocks-since-activity (- stacks-block-height (get last-activity current-rep)))
+  )
+    (asserts! (get-member-status member) ERR_NOT_MEMBER)
+    (asserts! (> blocks-since-activity u2016) ERR_INVALID_REPUTATION)
+    (map-set member-reputation member (merge current-rep {
+      total-points: (if (> (get total-points current-rep) decay-rate) (- (get total-points current-rep) decay-rate) u0)
+    }))
+    (ok true)
+  )
+)
+
+(define-public (claim-merit-badge (badge-id uint))
+  (let (
+    (badge (unwrap! (get-merit-badge badge-id) ERR_BADGE_NOT_FOUND))
+    (member-rep (get-member-reputation tx-sender))
+  )
+    (asserts! (get-member-status tx-sender) ERR_NOT_MEMBER)
+    (asserts! (get active badge) ERR_BADGE_NOT_FOUND)
+    (asserts! (>= (get total-points member-rep) (get points-required badge)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (is-none (get-member-badge tx-sender badge-id)) ERR_BADGE_ALREADY_EARNED)
+    (map-set member-badges { member: tx-sender, badge-id: badge-id } { earned-at: stacks-block-height, verified: true })
+    (ok true)
+  )
+)
+
+(define-private (check-and-award-badges (member principal))
+  (let ((member-rep (get-member-reputation member)))
+    (begin
+      (if (>= (get total-points member-rep) u100)
+        (map-set member-badges { member: member, badge-id: u1 } { earned-at: stacks-block-height, verified: true })
+        true
+      )
+      (if (>= (get successful-proposals member-rep) u5)
+        (map-set member-badges { member: member, badge-id: u2 } { earned-at: stacks-block-height, verified: true })
+        true
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (calculate-reputation-voting-power (member principal))
+  (let (
+    (base-power (get-member-voting-power member))
+    (reputation (get-member-reputation member))
+    (reputation-multiplier (/ (get total-points reputation) u50))
+    (capped-multiplier (if (> reputation-multiplier u3) u3 reputation-multiplier))
+  )
+    (+ base-power capped-multiplier)
+  )
+)
+
+(define-read-only (get-member-rank (member principal))
+  (let ((reputation (get-member-reputation member)))
+    (if (>= (get total-points reputation) u500)
+      "Expert"
+      (if (>= (get total-points reputation) u250)
+        "Advanced"
+        (if (>= (get total-points reputation) u100)
+          "Intermediate"
+          (if (>= (get total-points reputation) u50)
+            "Contributor"
+            "Newcomer"
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (deactivate-merit-badge (badge-id uint))
+  (let ((badge (unwrap! (get-merit-badge badge-id) ERR_BADGE_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set merit-badges badge-id (merge badge { active: false }))
+    (ok true)
+  )
+)
+
 ;; (define-read-only (get-amendment-yes-votes (amendment-id uint))
 ;;   (fold count-amendment-yes-votes (list) u0)
 ;; )
@@ -440,3 +666,6 @@
     false
   )
 )
+
+
+
